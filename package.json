@@ -1,6 +1,6 @@
 {
   "name": "@gratheon/log-lib",
-  "version": "2.2.5",
+  "version": "2.2.6",
   "description": "Logging library with console and MySQL database persistence",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
