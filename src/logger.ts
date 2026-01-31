@@ -7,6 +7,7 @@ import { LoggerConfig, Logger, FastifyLogger, LogMetadata, LogLevel } from "./ty
 
 let conn: ConnectionPool | null = null;
 let dbInitialized = false;
+let initPromise: Promise<void> | null = null;
 
 const LOG_LEVELS: Record<LogLevel, number> = {
   debug: 0,
@@ -297,25 +298,43 @@ function safeMeta(meta: any): any {
 }
 
 function storeInDB(level: string, message: any, meta?: any, stacktrace?: string) {
-  if (!conn || !dbInitialized) {
-    // Database not ready yet, skip DB logging
+  if (!conn) {
+    // Database not configured, skip DB logging
     return;
   }
-  try {
-    const msg = safeToStringMessage(message);
-    const metaObj = safeMeta(meta);
-    const metaStr = jsonStringify(metaObj).slice(0, 2000);
-    const stackStr = stacktrace || '';
-    // Fire and forget; avoid awaiting in hot path. Catch errors to avoid unhandled rejection.
-    conn.query(sql`INSERT INTO \`logs\` (level, message, meta, stacktrace, timestamp) VALUES (${level}, ${msg}, ${metaStr}, ${stackStr}, NOW())`).catch(e => {
+  
+  // Wait for initialization to complete before writing
+  const doStore = async () => {
+    if (initPromise) {
+      await initPromise.catch(() => {}); // Wait but ignore errors
+    }
+    
+    if (!dbInitialized) {
+      // Initialization failed, skip DB logging
+      return;
+    }
+    
+    try {
+      const msg = safeToStringMessage(message);
+      const metaObj = safeMeta(meta);
+      const metaStr = jsonStringify(metaObj).slice(0, 2000);
+      const stackStr = stacktrace || '';
+      
+      await conn!.query(sql`INSERT INTO \`logs\` (level, message, meta, stacktrace, timestamp) VALUES (${level}, ${msg}, ${metaStr}, ${stackStr}, NOW())`);
+    } catch (e: any) {
       // fallback console output only - but don't spam
       if (process.env.ENV_ID === 'dev') {
         console.error('Failed to persist log to DB', e);
       }
-    });
-  } catch (e) {
-    console.error('Unexpected failure preparing log for DB', e);
-  }
+    }
+  };
+  
+  // Fire and forget
+  doStore().catch(e => {
+    if (process.env.ENV_ID === 'dev') {
+      console.error('Unexpected failure preparing log for DB', e);
+    }
+  });
 }
 
 export function createLogger(config: LoggerConfig = {}): { logger: Logger; fastifyLogger: FastifyLogger } {
@@ -327,11 +346,9 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
   
   currentLogLevel = LOG_LEVELS[configuredLevel] ?? LOG_LEVELS.info;
   
-  // Start initialization asynchronously but don't wait for it (only if MySQL config provided)
+  // Start initialization asynchronously (only if MySQL config provided)
   if (config.mysql) {
-    initializeConnection(config).catch(err => {
-      console.error('Error during log database initialization:', err);
-    });
+    initPromise = initializeConnection(config);
   }
 
   const logger: Logger = {
