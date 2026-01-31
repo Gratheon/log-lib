@@ -91,6 +91,19 @@ async function initializeConnection(config: LoggerConfig) {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
     `);
     
+    // Run migrations: Add stacktrace column if it doesn't exist (for existing tables)
+    try {
+      const columns = await conn.query(sql`SHOW COLUMNS FROM \`logs\` LIKE 'stacktrace'`);
+      if (columns.length === 0) {
+        console.log('[log-lib] Running migration: Adding stacktrace column...');
+        await conn.query(sql`ALTER TABLE \`logs\` ADD COLUMN \`stacktrace\` TEXT AFTER \`meta\``);
+        console.log('[log-lib] Migration complete: stacktrace column added');
+      }
+    } catch (migrationErr) {
+      console.error('[log-lib] Migration failed (non-critical):', migrationErr);
+      // Don't fail initialization if migration fails
+    }
+    
     dbInitialized = true;
   } catch (err) {
     console.error('Failed to initialize logs database:', err);

@@ -32,7 +32,12 @@ npm install @gratheon/log-lib
 
 The logger automatically creates the database and table on first initialization. No manual setup required!
 
-For reference, the migration script is available at `migrations/001-create-logs-table.sql`.
+**Automatic Migrations**: When updating from older versions, the logger automatically runs migrations on initialization:
+- Checks if the `stacktrace` column exists
+- Adds it if missing (for v2.2.0+ compatibility)
+- Non-blocking: app starts even if migration fails
+
+For reference, migration scripts are available in the `migrations/` directory.
 
 ## Usage
 
