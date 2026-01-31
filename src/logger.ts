@@ -1,14 +1,51 @@
+import 'source-map-support/register';
 import createConnectionPool, { sql, ConnectionPool } from "@databases/mysql";
 import jsonStringify from "fast-safe-stringify";
 import * as fs from 'fs';
 import * as path from 'path';
-import { LoggerConfig, Logger, FastifyLogger, LogMetadata } from "./types";
+import { LoggerConfig, Logger, FastifyLogger, LogMetadata, LogLevel } from "./types";
 
 let conn: ConnectionPool | null = null;
 let dbInitialized = false;
 
+const LOG_LEVELS: Record<LogLevel, number> = {
+  debug: 0,
+  info: 1,
+  warn: 2,
+  error: 3
+};
+
+let currentLogLevel: number = LOG_LEVELS.info;
+
+// Get the project root (where the service is running from)
+const projectRoot = process.cwd();
+
+// Helper function to convert absolute paths to relative paths
+function makePathRelative(filePath: string): string {
+  if (filePath.startsWith(projectRoot)) {
+    return path.relative(projectRoot, filePath);
+  }
+  return filePath;
+}
+
+// Helper function to clean up stack trace paths
+function cleanStackTrace(stack: string): string {
+  if (!stack) return '';
+  
+  return stack.split('\n').map(line => {
+    // Match file paths in stack traces
+    return line.replace(/\(([^)]+)\)/g, (match, filePath) => {
+      const cleaned = makePathRelative(filePath);
+      return `(${cleaned})`;
+    }).replace(/at\s+([^\s]+:\d+:\d+)/g, (match, filePath) => {
+      const cleaned = makePathRelative(filePath);
+      return `at ${cleaned}`;
+    });
+  }).join('\n');
+}
+
 async function initializeConnection(config: LoggerConfig) {
-  if (dbInitialized) return;
+  if (dbInitialized || !config.mysql) return;
   
   try {
     const database = config.mysql.database || 'logs';
@@ -47,6 +84,7 @@ async function initializeConnection(config: LoggerConfig) {
         level VARCHAR(50),
         message TEXT,
         meta TEXT,
+        stacktrace TEXT,
         timestamp DATETIME,
         INDEX idx_timestamp (timestamp),
         INDEX idx_level (level)
@@ -60,7 +98,14 @@ async function initializeConnection(config: LoggerConfig) {
   }
 }
 
-function log(level: string, message: string, meta?: any) {
+function log(level: string, message: string, meta?: any, fileLocation?: string) {
+  // Check if this log level should be filtered
+  const levelKey = level.replace(/\x1b\[\d+m/g, '') as LogLevel; // Remove ANSI codes for comparison
+  const messageLevel = LOG_LEVELS[levelKey];
+  if (messageLevel !== undefined && messageLevel < currentLogLevel) {
+    return; // Skip logging this message
+  }
+
   let time = new Date().toISOString();
   let hhMMTime = time.slice(11, 19);
   // colorize time to have ansi blue color
@@ -84,36 +129,64 @@ function log(level: string, message: string, meta?: any) {
     meta = `\x1b[35m${meta}\x1b[0m`;
   }
 
-  console.log(`${hhMMTime} [${level}]: ${message} ${meta}`);
+  // Add gray file:line location if provided
+  const location = fileLocation ? ` \x1b[90m${fileLocation}\x1b[0m` : '';
+
+  console.log(`${hhMMTime} [${level}]: ${message} ${meta}${location}`);
 }
 
-function formatStack(stack?: string): string {
+function formatStack(stack?: string, maxLines: number = 3): string {
   if (!stack) return '';
+  // Clean up paths first
+  const cleanedStack = cleanStackTrace(stack);
+  
   // Remove first line if it duplicates the error message already printed.
-  const lines = stack.split('\n');
+  const lines = cleanedStack.split('\n');
   if (lines.length > 1 && lines[0].startsWith('Error')) {
     lines.shift();
   }
-  // Grey color for stack lines
-  return lines.map(l => `\x1b[90m${l}\x1b[0m`).join('\n');
+  // Limit to first N lines and grey color for stack lines
+  const limitedLines = lines.slice(0, maxLines);
+  return limitedLines.map(l => `\x1b[90m${l}\x1b[0m`).join('\n');
 }
 
 function extractFirstProjectFrame(stack?: string): {file?: string, line?: number, column?: number} {
   if (!stack) return {};
-  const lines = stack.split('\n');
+  const cleanedStack = cleanStackTrace(stack);
+  const lines = cleanedStack.split('\n');
   for (const l of lines) {
-    // Match: at FunctionName (/app/src/some/file.ts:123:45)
+    // Match: at FunctionName (src/some/file.ts:123:45)
     const m = l.match(/\(([^()]+\.ts):(\d+):(\d+)\)/);
     if (m) {
       return {file: m[1], line: parseInt(m[2], 10), column: parseInt(m[3], 10)};
     }
-    // Alternate format: at /app/src/file.ts:123:45
+    // Alternate format: at src/file.ts:123:45
     const m2 = l.match(/\s(at\s)?([^()]+\.ts):(\d+):(\d+)/);
     if (m2) {
       return {file: m2[2], line: parseInt(m2[3], 10), column: parseInt(m2[4], 10)};
     }
   }
   return {};
+}
+
+function extractFullTsStacktrace(stack?: string): string {
+  if (!stack) return '';
+  const cleanedStack = cleanStackTrace(stack);
+  const lines = cleanedStack.split('\n');
+  // Filter only TypeScript files
+  const tsLines = lines.filter(l => l.includes('.ts:') || l.includes('.ts)'));
+  return tsLines.join('\n');
+}
+
+function captureCallStack(): string {
+  const err = new Error();
+  if (!err.stack) return '';
+  const cleanedStack = cleanStackTrace(err.stack);
+  const lines = cleanedStack.split('\n');
+  // Skip first line (Error:) and this function call + log function calls
+  // Keep only .ts files
+  const tsLines = lines.slice(1).filter(l => l.includes('.ts:') || l.includes('.ts)'));
+  return tsLines.join('\n');
 }
 
 function buildCodeFrame(frame: {file?: string, line?: number, column?: number}): string {
@@ -207,7 +280,7 @@ function safeMeta(meta: any): any {
   return meta;
 }
 
-function storeInDB(level: string, message: any, meta?: any) {
+function storeInDB(level: string, message: any, meta?: any, stacktrace?: string) {
   if (!conn || !dbInitialized) {
     // Database not ready yet, skip DB logging
     return;
@@ -216,8 +289,9 @@ function storeInDB(level: string, message: any, meta?: any) {
     const msg = safeToStringMessage(message);
     const metaObj = safeMeta(meta);
     const metaStr = jsonStringify(metaObj).slice(0, 2000);
+    const stackStr = stacktrace || '';
     // Fire and forget; avoid awaiting in hot path. Catch errors to avoid unhandled rejection.
-    conn.query(sql`INSERT INTO \`logs\` (level, message, meta, timestamp) VALUES (${level}, ${msg}, ${metaStr}, NOW())`).catch(e => {
+    conn.query(sql`INSERT INTO \`logs\` (level, message, meta, stacktrace, timestamp) VALUES (${level}, ${msg}, ${metaStr}, ${stackStr}, NOW())`).catch(e => {
       // fallback console output only - but don't spam
       if (process.env.ENV_ID === 'dev') {
         console.error('Failed to persist log to DB', e);
@@ -228,67 +302,115 @@ function storeInDB(level: string, message: any, meta?: any) {
   }
 }
 
-export function createLogger(config: LoggerConfig): { logger: Logger; fastifyLogger: FastifyLogger } {
-  // Start initialization asynchronously but don't wait for it
-  initializeConnection(config).catch(err => {
-    console.error('Error during log database initialization:', err);
-  });
+export function createLogger(config: LoggerConfig = {}): { logger: Logger; fastifyLogger: FastifyLogger } {
+  // Set up log level filtering
+  // Priority: 1) config.logLevel, 2) process.env.LOG_LEVEL, 3) default based on ENV_ID
+  const configuredLevel = config.logLevel || 
+    (process.env.LOG_LEVEL as LogLevel) || 
+    (process.env.ENV_ID === 'dev' ? 'debug' : 'info');
+  
+  currentLogLevel = LOG_LEVELS[configuredLevel] ?? LOG_LEVELS.info;
+  
+  // Start initialization asynchronously but don't wait for it (only if MySQL config provided)
+  if (config.mysql) {
+    initializeConnection(config).catch(err => {
+      console.error('Error during log database initialization:', err);
+    });
+  }
 
   const logger: Logger = {
     info: (message: string, meta?: LogMetadata) => {
       const metaObj = safeMeta(meta);
-      log('info', safeToStringMessage(message), metaObj);
-      storeInDB('info', message, metaObj);
+      const callStack = captureCallStack();
+      const fullTsStack = extractFullTsStacktrace(callStack);
+      const frame = extractFirstProjectFrame(callStack);
+      const fileLocation = frame.file && frame.line ? `${frame.file}:${frame.line}` : undefined;
+      
+      log('info', safeToStringMessage(message), metaObj, fileLocation);
+      storeInDB('info', message, metaObj, fullTsStack);
     },
     error: (message: string | Error | any, meta?: LogMetadata) => {
       const metaObj = safeMeta(meta);
       if (message instanceof Error) {
         const causeChain = buildCauseChain(message);
-        const enrichedMeta = {stack: message.stack, name: message.name, causeChain, ...metaObj};
-        log('error', message.message, enrichedMeta);
+        const fullTsStack = extractFullTsStacktrace(message.stack);
+        const frame = extractFirstProjectFrame(message.stack);
+        const fileLocation = frame.file && frame.line ? `${frame.file}:${frame.line}` : undefined;
+        
+        // For console: show message + metadata (without stack), then stack separately
+        log('error', message.message, metaObj, fileLocation);
         if (message.stack) {
           printStackEnhanced(message);
         }
         if (causeChain.length) {
           console.log('\x1b[35mCause chain:\x1b[0m ' + causeChain.join(' -> '));
         }
-        storeInDB('error', message.message, enrichedMeta);
+        
+        // For DB: include stack and error details in metadata
+        const enrichedMeta = {stack: message.stack, name: message.name, causeChain, ...metaObj};
+        storeInDB('error', message.message, enrichedMeta, fullTsStack);
         return;
       }
       const msgStr = safeToStringMessage(message);
-      log('error', msgStr, metaObj);
+      const callStack = captureCallStack();
+      const fullTsStack = extractFullTsStacktrace(callStack);
+      const frame = extractFirstProjectFrame(callStack);
+      const fileLocation = frame.file && frame.line ? `${frame.file}:${frame.line}` : undefined;
+      
+      log('error', msgStr, metaObj, fileLocation);
       printStackEnhanced(message);
-      storeInDB('error', msgStr, metaObj);
+      storeInDB('error', msgStr, metaObj, fullTsStack);
     },
     errorEnriched: (message: string, error: Error | any, meta?: LogMetadata) => {
       const metaObj = safeMeta(meta);
       if (error instanceof Error) {
         const causeChain = buildCauseChain(error);
-        const enrichedMeta = {stack: error.stack, name: error.name, causeChain, ...metaObj};
-        log('error', `${message}: ${error.message}`, enrichedMeta);
+        const fullTsStack = extractFullTsStacktrace(error.stack);
+        const frame = extractFirstProjectFrame(error.stack);
+        const fileLocation = frame.file && frame.line ? `${frame.file}:${frame.line}` : undefined;
+        
+        // For console: show message + metadata (without stack), then stack separately
+        log('error', `${message}: ${error.message}`, metaObj, fileLocation);
         if (error.stack) {
           printStackEnhanced(error);
         }
         if (causeChain.length) {
           console.log('\x1b[35mCause chain:\x1b[0m ' + causeChain.join(' -> '));
         }
-        storeInDB('error', `${message}: ${error.message}`, enrichedMeta);
+        
+        // For DB: include stack and error details in metadata
+        const enrichedMeta = {stack: error.stack, name: error.name, causeChain, ...metaObj};
+        storeInDB('error', `${message}: ${error.message}`, enrichedMeta, fullTsStack);
         return;
       }
       const errStr = safeToStringMessage(error);
-      log('error', `${message}: ${errStr}`, metaObj);
+      const callStack = captureCallStack();
+      const fullTsStack = extractFullTsStacktrace(callStack);
+      const frame = extractFirstProjectFrame(callStack);
+      const fileLocation = frame.file && frame.line ? `${frame.file}:${frame.line}` : undefined;
+      
+      log('error', `${message}: ${errStr}`, metaObj, fileLocation);
       printStackEnhanced(error);
-      storeInDB('error', `${message}: ${errStr}`, metaObj);
+      storeInDB('error', `${message}: ${errStr}`, metaObj, fullTsStack);
     },
     warn: (message: string, meta?: LogMetadata) => {
       const metaObj = safeMeta(meta);
-      log('warn', safeToStringMessage(message), metaObj);
-      storeInDB('warn', message, metaObj);
+      const callStack = captureCallStack();
+      const fullTsStack = extractFullTsStacktrace(callStack);
+      const frame = extractFirstProjectFrame(callStack);
+      const fileLocation = frame.file && frame.line ? `${frame.file}:${frame.line}` : undefined;
+      
+      log('warn', safeToStringMessage(message), metaObj, fileLocation);
+      storeInDB('warn', message, metaObj, fullTsStack);
     },
 
     // do not store debug logs in DB
     debug: (message: string, meta?: LogMetadata) => {
-      log('debug', safeToStringMessage(message), safeMeta(meta));
+      const callStack = captureCallStack();
+      const frame = extractFirstProjectFrame(callStack);
+      const fileLocation = frame.file && frame.line ? `${frame.file}:${frame.line}` : undefined;
+      
+      log('debug', safeToStringMessage(message), safeMeta(meta), fileLocation);
     },
   };
 
@@ -296,31 +418,54 @@ export function createLogger(config: LoggerConfig): { logger: Logger; fastifyLog
     // Stringify potential objects passed to info/warn
     info: (msg: any, ...args: any[]) => {
       const messageString = typeof msg === 'object' ? jsonStringify(msg) : String(msg);
-      log("info", messageString);
+      const callStack = captureCallStack();
+      const frame = extractFirstProjectFrame(callStack);
+      const fileLocation = frame.file && frame.line ? `${frame.file}:${frame.line}` : undefined;
+      
+      log("info", messageString, undefined, fileLocation);
       // storeInDB("info", messageString); // Keep commented out as original
     },
     error: (msg: any, ...args: any[]) => {
       const errorMessage = (msg && msg.message) ? msg.message : String(msg);
       const meta = args.length > 0 ? args[0] : undefined;
-      log("error", errorMessage, meta);
+      const callStack = msg?.stack || captureCallStack();
+      const fullTsStack = extractFullTsStacktrace(callStack);
+      const frame = extractFirstProjectFrame(callStack);
+      const fileLocation = frame.file && frame.line ? `${frame.file}:${frame.line}` : undefined;
+      
+      log("error", errorMessage, meta, fileLocation);
       // Ensure string is passed to storeInDB
-      storeInDB("error", typeof msg === 'object' ? jsonStringify(msg) : errorMessage, meta);
+      storeInDB("error", typeof msg === 'object' ? jsonStringify(msg) : errorMessage, meta, fullTsStack);
     },
     warn: (msg: any, ...args: any[]) => {
       const messageString = typeof msg === 'object' ? jsonStringify(msg) : String(msg);
-      log("warn", messageString);
-      storeInDB("warn", messageString); // Pass stringified message
+      const callStack = captureCallStack();
+      const fullTsStack = extractFullTsStacktrace(callStack);
+      const frame = extractFirstProjectFrame(callStack);
+      const fileLocation = frame.file && frame.line ? `${frame.file}:${frame.line}` : undefined;
+      
+      log("warn", messageString, undefined, fileLocation);
+      storeInDB("warn", messageString, undefined, fullTsStack); // Pass stringified message
     },
 
     // do not store debug logs in DB
     debug: (msg: any, ...args: any[]) => {
-      log("debug", String(msg));
+      const callStack = captureCallStack();
+      const frame = extractFirstProjectFrame(callStack);
+      const fileLocation = frame.file && frame.line ? `${frame.file}:${frame.line}` : undefined;
+      
+      log("debug", String(msg), undefined, fileLocation);
     },
 
     fatal: (msg: any, ...args: any[]) => {
       const messageString = typeof msg === 'object' ? jsonStringify(msg) : String(msg);
-      log("error", messageString);
-      storeInDB("error", messageString);
+      const callStack = captureCallStack();
+      const fullTsStack = extractFullTsStacktrace(callStack);
+      const frame = extractFirstProjectFrame(callStack);
+      const fileLocation = frame.file && frame.line ? `${frame.file}:${frame.line}` : undefined;
+      
+      log("error", messageString, undefined, fileLocation);
+      storeInDB("error", messageString, undefined, fullTsStack);
       // Exit after a brief delay to allow logs to flush
       setTimeout(() => process.exit(1), 100);
     },

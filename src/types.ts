@@ -1,11 +1,14 @@
+export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+
 export interface LoggerConfig {
-  mysql: {
+  mysql?: {
     host: string;
     port: number;
     user: string;
     password: string;
     database?: string; // defaults to 'logs'
   };
+  logLevel?: LogLevel; // defaults to 'info' in production, 'debug' in dev
 }
 
 export interface LogMetadata {

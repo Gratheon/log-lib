@@ -6,6 +6,9 @@ A TypeScript logging library with console output and MySQL database persistence 
 
 - **Dual Output**: Logs to both console and MySQL database
 - **Color-Coded Console**: ANSI colored output for different log levels
+- **Automatic Stacktrace Capture**: Every log includes file:line information
+  - **CLI Output**: Shows the most relevant TypeScript file:line in gray color
+  - **Database Storage**: Stores full stacktrace filtered to TypeScript files only
 - **Enhanced Stack Traces**: Shows code frames with 5 lines of context around errors (dev mode)
 - **Error Cause Chain Tracking**: Traverses and displays the full error.cause chain
 - **Callsite Capture**: Captures where logger.error was called when error lacks stack frames
@@ -17,6 +20,7 @@ A TypeScript logging library with console output and MySQL database persistence 
 - **Fastify Integration**: Special logger interface for Fastify framework
 - **Flexible Metadata**: Support for structured metadata in logs
 - **Multiple Log Levels**: info, error, warn, debug (debug logs are not persisted to DB)
+- **Log Level Filtering**: Configure minimum log level via config or LOG_LEVEL env var
 
 ## Installation
 
@@ -44,14 +48,19 @@ const config: LoggerConfig = {
     user: 'your_user',
     password: 'your_password',
     database: 'logs' // optional, defaults to 'logs'
-  }
+  },
+  logLevel: 'info' // optional, defaults to 'debug' in dev, 'info' in prod
 };
 
 const { logger, fastifyLogger } = createLogger(config);
 
-// Log messages
+// Log messages - each log automatically includes file:line location
 logger.info('Application started');
+// Output: 12:34:56 [info]: Application started  src/index.ts:42
+
 logger.warn('Low memory warning', { available: '100MB' });
+// Output: 12:34:56 [warn]: Low memory warning {"available":"100MB"} src/memory.ts:15
+
 logger.error('Failed to connect to API', { endpoint: '/api/users' });
 logger.debug('Processing item', { id: 123 }); // Not stored in DB
 
@@ -197,22 +206,26 @@ Set `ENV_ID` to control behavior:
 ## Console Output Colors
 
 - **Time**: Blue
-- **Error**: Red (level) + Magenta (metadata)
-- **Info**: Green (level) + Magenta (metadata)
-- **Debug**: Gray (dimmed)
-- **Warn**: Yellow (level) + Magenta (metadata)
+- **Error**: Red (level) + Magenta (metadata) + Gray (file:line)
+- **Info**: Green (level) + Magenta (metadata) + Gray (file:line)
+- **Debug**: Gray (dimmed, including file:line)
+- **Warn**: Yellow (level) + Magenta (metadata) + Gray (file:line)
+- **File Location**: Gray (file:line) - automatically captured from call stack
 
 ## Database Schema
 
 ```sql
 CREATE TABLE `logs` (
-    `id`        int auto_increment primary key,
-    `level`     varchar(16)   not null,
-    `message`   varchar(2048) not null,
-    `meta`      varchar(2048) not null,
-    `timestamp` datetime      not null
+    `id`         int auto_increment primary key,
+    `level`      varchar(16)   not null,
+    `message`    varchar(2048) not null,
+    `meta`       varchar(2048) not null,
+    `stacktrace` text,
+    `timestamp`  datetime      not null
 );
 ```
+
+The `stacktrace` column stores the full call stack filtered to TypeScript files only, making it easy to trace the origin of each log entry.
 
 ## Error Handling
 
@@ -258,13 +271,14 @@ try {
 
 ```typescript
 interface LoggerConfig {
-  mysql: {
+  mysql?: {
     host: string;
     port: number;
     user: string;
     password: string;
     database?: string; // defaults to 'logs'
   };
+  logLevel?: LogLevel; // 'debug' | 'info' | 'warn' | 'error', defaults to 'debug' in dev, 'info' in prod
 }
 
 interface LogMetadata {
