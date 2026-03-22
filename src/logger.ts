@@ -1,13 +1,22 @@
 import 'source-map-support/register';
-import createConnectionPool, { sql, ConnectionPool } from "@databases/mysql";
+import * as http from 'http';
+import * as https from 'https';
 import jsonStringify from "fast-safe-stringify";
 import * as fs from 'fs';
 import * as path from 'path';
 import { LoggerConfig, Logger, FastifyLogger, LogMetadata, LogLevel } from "./types";
 
-let conn: ConnectionPool | null = null;
-let dbInitialized = false;
-let initPromise: Promise<void> | null = null;
+type LokiRuntimeConfig = {
+  enabled: boolean;
+  url: string;
+  service: string;
+  labels: Record<string, string>;
+  username?: string;
+  password?: string;
+  tenantId?: string;
+};
+
+let lokiConfig: LokiRuntimeConfig | null = null;
 
 const LOG_LEVELS: Record<LogLevel, number> = {
   debug: 0,
@@ -45,74 +54,37 @@ function cleanStackTrace(stack: string): string {
   }).join('\n');
 }
 
-async function initializeConnection(config: LoggerConfig) {
-  if (dbInitialized || !config.mysql) return;
-  
-  try {
-    const database = config.mysql.database || 'logs';
-    
-    // First connect without database to create it if needed
-    const tempConn = createConnectionPool({
-      connectionString: `mysql://${config.mysql.user}:${config.mysql.password}@${config.mysql.host}:${config.mysql.port}/?connectionLimit=1&waitForConnections=true`,
-      bigIntMode: 'number',
-    });
-    
-    await tempConn.query(sql`CREATE DATABASE IF NOT EXISTS ${sql.ident(database)} CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;`);
-    await tempConn.dispose();
-    
-    // Now create the main connection pool with the logs database
-    conn = createConnectionPool({
-      connectionString: `mysql://${config.mysql.user}:${config.mysql.password}@${config.mysql.host}:${config.mysql.port}/${database}?connectionLimit=3&waitForConnections=true`,
-      bigIntMode: 'number',
-      poolSize: 3,
-      maxUses: 200,
-      idleTimeoutMilliseconds: 30_000,
-      queueTimeoutMilliseconds: 60_000,
-      onError: (err) => {
-        // Suppress "packets out of order" and inactivity warnings
-        if (!err.message?.includes('packets out of order') && 
-            !err.message?.includes('inactivity') &&
-            !err.message?.includes('wait_timeout')) {
-          console.error(`MySQL logger connection pool error: ${err.message}`);
-        }
-      },
-    });
-    
-    // Create logs table if it doesn't exist
-    await conn.query(sql`
-      CREATE TABLE IF NOT EXISTS \`logs\` (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        level VARCHAR(50),
-        message TEXT,
-        meta TEXT,
-        stacktrace TEXT,
-        timestamp DATETIME,
-        INDEX idx_timestamp (timestamp),
-        INDEX idx_level (level)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
-    `);
-    
-    // Run migrations: Add stacktrace column if it doesn't exist (for existing tables created before v2.2.0)
-    try {
-      const columns = await conn.query(sql`SHOW COLUMNS FROM \`logs\` LIKE 'stacktrace'`);
-      if (columns.length === 0) {
-        console.log('[log-lib] Running migration: Adding stacktrace column...');
-        await conn.query(sql`ALTER TABLE \`logs\` ADD COLUMN \`stacktrace\` TEXT AFTER \`meta\``);
-        console.log('[log-lib] Migration complete: stacktrace column added');
-      } else {
-        console.log('[log-lib] Migration check: stacktrace column already exists');
-      }
-    } catch (migrationErr) {
-      console.error('[log-lib] Migration failed (non-critical):', migrationErr);
-      // Don't fail initialization if migration fails
-    }
-    
-    dbInitialized = true;
-    console.log('[log-lib] Database initialization complete');
-  } catch (err) {
-    console.error('Failed to initialize logs database:', err);
-    // Don't throw - allow the service to start even if logging DB fails
+function resolveLokiConfig(config: LoggerConfig): LokiRuntimeConfig | null {
+  const explicit = config.loki ?? {};
+  const enabled = explicit.enabled ?? true;
+  if (!enabled) {
+    return null;
   }
+
+  const url = explicit.url || process.env.LOKI_URL || 'http://loki:3100/loki/api/v1/push';
+  const service =
+    explicit.service ||
+    process.env.SERVICE_NAME ||
+    process.env.COMPOSE_SERVICE ||
+    process.env.npm_package_name ||
+    path.basename(process.cwd());
+
+  const labels: Record<string, string> = {
+    service,
+    env: process.env.ENV_ID || 'unknown',
+    logger: 'log-lib',
+    ...(explicit.labels || {}),
+  };
+
+  return {
+    enabled,
+    url,
+    service,
+    labels,
+    username: explicit.username,
+    password: explicit.password,
+    tenantId: explicit.tenantId,
+  };
 }
 
 function log(level: string, message: string, meta?: any, fileLocation?: string) {
@@ -297,44 +269,78 @@ function safeMeta(meta: any): any {
   return meta;
 }
 
-function storeInDB(level: string, message: any, meta?: any, stacktrace?: string) {
-  if (!conn) {
-    // Database not configured, skip DB logging
+function storeInLoki(level: LogLevel, message: any, meta?: any, stacktrace?: string) {
+  if (!lokiConfig || !lokiConfig.enabled) {
     return;
   }
-  
-  // Wait for initialization to complete before writing
-  const doStore = async () => {
-    if (initPromise) {
-      await initPromise.catch(() => {}); // Wait but ignore errors
+
+  try {
+    const nowNs = `${Date.now()}000000`;
+    const payloadObject = {
+      timestamp: new Date().toISOString(),
+      level,
+      service: lokiConfig.service,
+      message: safeToStringMessage(message),
+      meta: safeMeta(meta),
+      stacktrace: stacktrace || '',
+    };
+
+    const line = jsonStringify(payloadObject).slice(0, 120_000);
+    const body = jsonStringify({
+      streams: [
+        {
+          stream: lokiConfig.labels,
+          values: [[nowNs, line]],
+        },
+      ],
+    });
+
+    const target = new URL(lokiConfig.url);
+    const isHttps = target.protocol === 'https:';
+    const client = isHttps ? https : http;
+    const headers: Record<string, string> = {
+      'content-type': 'application/json',
+      'content-length': Buffer.byteLength(body).toString(),
+    };
+
+    if (lokiConfig.tenantId) {
+      headers['X-Scope-OrgID'] = lokiConfig.tenantId;
     }
-    
-    if (!dbInitialized) {
-      // Initialization failed, skip DB logging
-      return;
+    if (lokiConfig.username && lokiConfig.password) {
+      const basic = Buffer.from(`${lokiConfig.username}:${lokiConfig.password}`).toString('base64');
+      headers['authorization'] = `Basic ${basic}`;
     }
-    
-    try {
-      const msg = safeToStringMessage(message);
-      const metaObj = safeMeta(meta);
-      const metaStr = jsonStringify(metaObj).slice(0, 2000);
-      const stackStr = stacktrace || '';
-      
-      await conn!.query(sql`INSERT INTO \`logs\` (level, message, meta, stacktrace, timestamp) VALUES (${level}, ${msg}, ${metaStr}, ${stackStr}, NOW())`);
-    } catch (e: any) {
-      // fallback console output only - but don't spam
-      if (process.env.ENV_ID === 'dev') {
-        console.error('Failed to persist log to DB', e);
+
+    const req = client.request(
+      {
+        protocol: target.protocol,
+        hostname: target.hostname,
+        port: target.port || (isHttps ? 443 : 80),
+        path: `${target.pathname}${target.search}`,
+        method: 'POST',
+        headers,
+      },
+      (res) => {
+        if (res.statusCode && res.statusCode >= 400 && process.env.ENV_ID === 'dev') {
+          console.error(`[log-lib] Failed to persist log to Loki: HTTP ${res.statusCode}`);
+        }
+        res.resume();
       }
-    }
-  };
-  
-  // Fire and forget
-  doStore().catch(e => {
+    );
+
+    req.on('error', (e: any) => {
+      if (process.env.ENV_ID === 'dev') {
+        console.error('[log-lib] Failed to persist log to Loki', e?.message || e);
+      }
+    });
+
+    req.write(body);
+    req.end();
+  } catch (e: any) {
     if (process.env.ENV_ID === 'dev') {
-      console.error('Unexpected failure preparing log for DB', e);
+      console.error('[log-lib] Unexpected failure preparing log for Loki', e?.message || e);
     }
-  });
+  }
 }
 
 export function createLogger(config: LoggerConfig = {}): { logger: Logger; fastifyLogger: FastifyLogger } {
@@ -346,9 +352,9 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
   
   currentLogLevel = LOG_LEVELS[configuredLevel] ?? LOG_LEVELS.info;
   
-  // Start initialization asynchronously (only if MySQL config provided)
-  if (config.mysql) {
-    initPromise = initializeConnection(config);
+  lokiConfig = resolveLokiConfig(config);
+  if (config.mysql && process.env.ENV_ID === 'dev') {
+    console.warn('[log-lib] `config.mysql` is deprecated and ignored. Logs are persisted to Loki.');
   }
 
   const logger: Logger = {
@@ -360,7 +366,7 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
       const fileLocation = frame.file && frame.line ? `${frame.file}:${frame.line}` : undefined;
       
       log('info', safeToStringMessage(message), metaObj, fileLocation);
-      storeInDB('info', message, metaObj, fullTsStack);
+      storeInLoki('info', message, metaObj, fullTsStack);
     },
     error: (message: string | Error | any, meta?: LogMetadata) => {
       const metaObj = safeMeta(meta);
@@ -379,9 +385,9 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
           console.log('\x1b[35mCause chain:\x1b[0m ' + causeChain.join(' -> '));
         }
         
-        // For DB: include stack and error details in metadata
+        // For Loki: include stack and error details in metadata
         const enrichedMeta = {stack: message.stack, name: message.name, causeChain, ...metaObj};
-        storeInDB('error', message.message, enrichedMeta, fullTsStack);
+        storeInLoki('error', message.message, enrichedMeta, fullTsStack);
         return;
       }
       const msgStr = safeToStringMessage(message);
@@ -392,7 +398,7 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
       
       log('error', msgStr, metaObj, fileLocation);
       printStackEnhanced(message);
-      storeInDB('error', msgStr, metaObj, fullTsStack);
+      storeInLoki('error', msgStr, metaObj, fullTsStack);
     },
     errorEnriched: (message: string, error: Error | any, meta?: LogMetadata) => {
       const metaObj = safeMeta(meta);
@@ -411,9 +417,9 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
           console.log('\x1b[35mCause chain:\x1b[0m ' + causeChain.join(' -> '));
         }
         
-        // For DB: include stack and error details in metadata
+        // For Loki: include stack and error details in metadata
         const enrichedMeta = {stack: error.stack, name: error.name, causeChain, ...metaObj};
-        storeInDB('error', `${message}: ${error.message}`, enrichedMeta, fullTsStack);
+        storeInLoki('error', `${message}: ${error.message}`, enrichedMeta, fullTsStack);
         return;
       }
       const errStr = safeToStringMessage(error);
@@ -424,7 +430,7 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
       
       log('error', `${message}: ${errStr}`, metaObj, fileLocation);
       printStackEnhanced(error);
-      storeInDB('error', `${message}: ${errStr}`, metaObj, fullTsStack);
+      storeInLoki('error', `${message}: ${errStr}`, metaObj, fullTsStack);
     },
     warn: (message: string, meta?: LogMetadata) => {
       const metaObj = safeMeta(meta);
@@ -434,7 +440,7 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
       const fileLocation = frame.file && frame.line ? `${frame.file}:${frame.line}` : undefined;
       
       log('warn', safeToStringMessage(message), metaObj, fileLocation);
-      storeInDB('warn', message, metaObj, fullTsStack);
+      storeInLoki('warn', message, metaObj, fullTsStack);
     },
 
     // do not store debug logs in DB
@@ -456,7 +462,7 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
       const fileLocation = frame.file && frame.line ? `${frame.file}:${frame.line}` : undefined;
       
       log("info", messageString, undefined, fileLocation);
-      // storeInDB("info", messageString); // Keep commented out as original
+      storeInLoki("info", messageString);
     },
     error: (msg: any, ...args: any[]) => {
       const errorMessage = (msg && msg.message) ? msg.message : String(msg);
@@ -467,8 +473,7 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
       const fileLocation = frame.file && frame.line ? `${frame.file}:${frame.line}` : undefined;
       
       log("error", errorMessage, meta, fileLocation);
-      // Ensure string is passed to storeInDB
-      storeInDB("error", typeof msg === 'object' ? jsonStringify(msg) : errorMessage, meta, fullTsStack);
+      storeInLoki("error", typeof msg === 'object' ? jsonStringify(msg) : errorMessage, meta, fullTsStack);
     },
     warn: (msg: any, ...args: any[]) => {
       const messageString = typeof msg === 'object' ? jsonStringify(msg) : String(msg);
@@ -478,7 +483,7 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
       const fileLocation = frame.file && frame.line ? `${frame.file}:${frame.line}` : undefined;
       
       log("warn", messageString, undefined, fileLocation);
-      storeInDB("warn", messageString, undefined, fullTsStack); // Pass stringified message
+      storeInLoki("warn", messageString, undefined, fullTsStack);
     },
 
     // do not store debug logs in DB
@@ -498,7 +503,7 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
       const fileLocation = frame.file && frame.line ? `${frame.file}:${frame.line}` : undefined;
       
       log("error", messageString, undefined, fileLocation);
-      storeInDB("error", messageString, undefined, fullTsStack);
+      storeInLoki("error", messageString, undefined, fullTsStack);
       // Exit after a brief delay to allow logs to flush
       setTimeout(() => process.exit(1), 100);
     },

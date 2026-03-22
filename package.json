@@ -1,7 +1,7 @@
 {
   "name": "@gratheon/log-lib",
-  "version": "2.2.7",
-  "description": "Logging library with console and MySQL database persistence",
+  "version": "3.0.0",
+  "description": "Logging library with console output and Loki persistence",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
@@ -12,13 +12,12 @@
   "keywords": [
     "logging",
     "logger",
-    "mysql",
+    "loki",
     "typescript"
   ],
-  "author": "",
+  "author": "Artjom Kurapov",
   "license": "ISC",
   "dependencies": {
-    "@databases/mysql": "^7.0.0",
     "fast-safe-stringify": "^2.1.1",
     "source-map-support": "^0.5.21"
   },

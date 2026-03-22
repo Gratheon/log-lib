@@ -1,25 +1,24 @@
 # log-lib
 
-A TypeScript logging library with console output and MySQL database persistence support.
+A TypeScript logging library with console output and Loki persistence support.
 
 ## Features
 
-- **Dual Output**: Logs to both console and MySQL database
+- **Dual Output**: Logs to both console and Loki
 - **Color-Coded Console**: ANSI colored output for different log levels
 - **Automatic Stacktrace Capture**: Every log includes file:line information
   - **CLI Output**: Shows the most relevant TypeScript file:line in gray color
-  - **Database Storage**: Stores full stacktrace filtered to TypeScript files only
+  - **Loki Storage**: Stores full stacktrace filtered to TypeScript files only
 - **Enhanced Stack Traces**: Shows code frames with 5 lines of context around errors (dev mode)
 - **Error Cause Chain Tracking**: Traverses and displays the full error.cause chain
 - **Callsite Capture**: Captures where logger.error was called when error lacks stack frames
-- **Automatic Database Creation**: Creates logs database and table if they don't exist
-- **Non-blocking Initialization**: App starts even if logging DB fails
-- **Connection Pool Optimization**: Suppresses known MySQL warnings for cleaner logs
+- **Non-blocking Delivery**: App starts even if Loki is unavailable
+- **Service Labels**: Emits structured logs with `service`/`env` labels for Loki queries
 - **Global Exception Handlers**: Captures uncaught exceptions and unhandled rejections
 - **TypeScript Support**: Full type definitions included
 - **Fastify Integration**: Special logger interface for Fastify framework
 - **Flexible Metadata**: Support for structured metadata in logs
-- **Multiple Log Levels**: info, error, warn, debug (debug logs are not persisted to DB)
+- **Multiple Log Levels**: info, error, warn, debug (debug logs are not persisted)
 - **Log Level Filtering**: Configure minimum log level via config or LOG_LEVEL env var
 
 ## Installation
@@ -28,16 +27,13 @@ A TypeScript logging library with console output and MySQL database persistence 
 npm install @gratheon/log-lib
 ```
 
-## Database Setup
+## Loki Setup
 
-The logger automatically creates the database and table on first initialization. No manual setup required!
+By default the logger pushes to `http://loki:3100/loki/api/v1/push`.
 
-**Automatic Migrations**: When updating from older versions, the logger automatically runs migrations on initialization:
-- Checks if the `stacktrace` column exists
-- Adds it if missing (for v2.2.0+ compatibility)
-- Non-blocking: app starts even if migration fails
-
-For reference, migration scripts are available in the `migrations/` directory.
+You can override with:
+- `config.loki.url`
+- `LOKI_URL` environment variable
 
 ## Usage
 
@@ -47,12 +43,10 @@ For reference, migration scripts are available in the `migrations/` directory.
 import { createLogger, LoggerConfig } from '@gratheon/log-lib';
 
 const config: LoggerConfig = {
-  mysql: {
-    host: 'localhost',
-    port: 3306,
-    user: 'your_user',
-    password: 'your_password',
-    database: 'logs' // optional, defaults to 'logs'
+  loki: {
+    url: 'http://loki:3100/loki/api/v1/push', // optional
+    service: 'user-cycle', // optional, defaults from env/current folder
+    labels: { team: 'platform' } // optional extra labels
   },
   logLevel: 'info' // optional, defaults to 'debug' in dev, 'info' in prod
 };
@@ -67,7 +61,7 @@ logger.warn('Low memory warning', { available: '100MB' });
 // Output: 12:34:56 [warn]: Low memory warning {"available":"100MB"} src/memory.ts:15
 
 logger.error('Failed to connect to API', { endpoint: '/api/users' });
-logger.debug('Processing item', { id: 123 }); // Not stored in DB
+logger.debug('Processing item', { id: 123 }); // Not persisted
 
 // Error with stack trace and code frame (in dev mode)
 try {
@@ -114,11 +108,9 @@ import Fastify from 'fastify';
 import { createLogger, LoggerConfig } from '@gratheon/log-lib';
 
 const config: LoggerConfig = {
-  mysql: {
-    host: 'localhost',
-    port: 3306,
-    user: 'your_user',
-    password: 'your_password'
+  loki: {
+    url: 'http://loki:3100/loki/api/v1/push',
+    service: 'my-fastify-service'
   }
 };
 
@@ -138,7 +130,7 @@ fastify.listen(3000);
 Creates and returns logger instances.
 
 **Parameters:**
-- `config`: Configuration object with MySQL connection details
+- `config`: Configuration object with Loki details
 
 **Returns:**
 ```typescript
@@ -151,16 +143,16 @@ Creates and returns logger instances.
 ### Logger Methods
 
 #### `logger.info(message: string, meta?: LogMetadata)`
-Logs informational messages (console + DB)
+Logs informational messages (console + Loki)
 
 #### `logger.error(message: string | Error, meta?: LogMetadata)`
-Logs errors with automatic Error object detection (console + DB)
+Logs errors with automatic Error object detection (console + Loki)
 
 #### `logger.errorEnriched(message: string, error: Error, meta?: LogMetadata)`
-Logs enriched error messages with context (console + DB)
+Logs enriched error messages with context (console + Loki)
 
 #### `logger.warn(message: string, meta?: LogMetadata)`
-Logs warning messages (console + DB)
+Logs warning messages (console + Loki)
 
 #### `logger.debug(message: string, meta?: LogMetadata)`
 Logs debug messages (console only, not persisted)
@@ -178,29 +170,15 @@ Compatible with Fastify's logger interface:
 
 ## Advanced Features
 
-### Connection Pool Configuration
+### Loki Delivery
 
-The logger uses an optimized connection pool:
-- Pool size: 3 connections
-- Max uses per connection: 200
-- Idle timeout: 30 seconds
-- Queue timeout: 60 seconds
-- Automatic error suppression for known MySQL warnings
+The logger sends logs directly to Loki's HTTP push API (`/loki/api/v1/push`) in fire-and-forget mode.
 
 ### Message Truncation
 
-To prevent database bloat:
-- Messages are truncated to 2000 characters
-- Metadata is truncated to 2000 characters
+To control payload size:
+- Large log payloads are truncated before push
 - JSON stringification uses `fast-safe-stringify` for circular reference handling
-
-### Async Initialization
-
-The logger initializes asynchronously in the background:
-```typescript
-const { logger } = createLogger(config);
-logger.info('App starting'); // Works immediately, DB writes happen when ready
-```
 
 ### Environment-Specific Behavior
 
@@ -217,35 +195,24 @@ Set `ENV_ID` to control behavior:
 - **Warn**: Yellow (level) + Magenta (metadata) + Gray (file:line)
 - **File Location**: Gray (file:line) - automatically captured from call stack
 
-## Database Schema
+## Loki Payload
 
-```sql
-CREATE TABLE `logs` (
-    `id`         int auto_increment primary key,
-    `level`      varchar(16)   not null,
-    `message`    varchar(2048) not null,
-    `meta`       varchar(2048) not null,
-    `stacktrace` text,
-    `timestamp`  datetime      not null
-);
-```
-
-The `stacktrace` column stores the full call stack filtered to TypeScript files only, making it easy to trace the origin of each log entry.
+Each persisted entry is sent as JSON line data with:
+- `timestamp`
+- `level`
+- `service`
+- `message`
+- `meta`
+- `stacktrace`
 
 ## Error Handling
 
 The logger provides comprehensive error handling:
 
-### Automatic Database Creation
-- Creates the `logs` database if it doesn't exist
-- Creates the `logs` table with proper schema and indexes
-- Non-blocking initialization - app starts even if DB fails
-
 ### Graceful Degradation
 - Logs are always written to console
-- Database errors are logged but don't crash the application
-- Connection pool errors are suppressed (packets out of order, inactivity warnings)
-- Fire-and-forget database logging (no await in hot path)
+- Loki delivery errors are logged but don't crash the application
+- Fire-and-forget Loki logging (no await in hot path)
 
 ### Enhanced Error Diagnostics
 - **Error Cause Chain**: Automatically traverses and displays `error.cause` chains
@@ -276,12 +243,14 @@ try {
 
 ```typescript
 interface LoggerConfig {
-  mysql?: {
-    host: string;
-    port: number;
-    user: string;
-    password: string;
-    database?: string; // defaults to 'logs'
+  loki?: {
+    url?: string; // defaults to process.env.LOKI_URL or http://loki:3100/loki/api/v1/push
+    service?: string; // defaults to process.env.SERVICE_NAME or cwd folder name
+    labels?: Record<string, string>;
+    username?: string;
+    password?: string;
+    tenantId?: string;
+    enabled?: boolean;
   };
   logLevel?: LogLevel; // 'debug' | 'info' | 'warn' | 'error', defaults to 'debug' in dev, 'info' in prod
 }

@@ -1,6 +1,21 @@
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
+export interface LokiConfig {
+  url?: string; // defaults to process.env.LOKI_URL or http://loki:3100/loki/api/v1/push
+  username?: string;
+  password?: string;
+  tenantId?: string;
+  service?: string; // defaults to process.env.SERVICE_NAME or current folder name
+  labels?: Record<string, string>;
+  enabled?: boolean; // defaults to true
+}
+
 export interface LoggerConfig {
+  loki?: LokiConfig;
+  /**
+   * @deprecated MySQL persistence has been replaced by Loki.
+   * Kept only for backward compatibility and ignored.
+   */
   mysql?: {
     host: string;
     port: number;

@@ -2,13 +2,11 @@ import { createLogger, LoggerConfig } from './src/index';
 
 // Example configuration
 const config: LoggerConfig = {
-  mysql: {
-    host: 'localhost',
-    port: 3306,
-    user: 'root',
-    password: 'test',
-    database: 'logs' // optional, defaults to 'logs'
-  }
+  loki: {
+    url: 'http://loki:3100/loki/api/v1/push',
+    service: 'example-service'
+  },
+  logLevel: 'info'
 };
 
 // Create logger instances
