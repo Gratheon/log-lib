@@ -1,7 +1,7 @@
 {
   "name": "@gratheon/log-lib",
-  "version": "3.0.0",
-  "description": "Logging library with console output and Loki persistence",
+  "version": "4.0.0",
+  "description": "Logging library with console output and OTLP persistence",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
@@ -12,12 +12,15 @@
   "keywords": [
     "logging",
     "logger",
-    "loki",
+    "otlp",
     "typescript"
   ],
   "author": "Artjom Kurapov",
   "license": "ISC",
   "dependencies": {
+    "@opentelemetry/exporter-logs-otlp-proto": "^0.216.0",
+    "@opentelemetry/resources": "^2.7.1",
+    "@opentelemetry/sdk-logs": "^0.216.0",
     "fast-safe-stringify": "^2.1.1",
     "source-map-support": "^0.5.21"
   },

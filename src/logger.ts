@@ -4,6 +4,9 @@ import * as https from 'https';
 import jsonStringify from "fast-safe-stringify";
 import * as fs from 'fs';
 import * as path from 'path';
+import { LoggerProvider, SimpleLogRecordProcessor } from '@opentelemetry/sdk-logs';
+import { OTLPLogExporter } from '@opentelemetry/exporter-logs-otlp-proto';
+import { resourceFromAttributes } from '@opentelemetry/resources';
 import { LoggerConfig, Logger, FastifyLogger, LogMetadata, LogLevel } from "./types";
 
 type LokiRuntimeConfig = {
@@ -17,6 +20,17 @@ type LokiRuntimeConfig = {
 };
 
 let lokiConfig: LokiRuntimeConfig | null = null;
+
+type OtlpRuntimeConfig = {
+  enabled: boolean;
+  endpoint: string;
+  headers: Record<string, string>;
+  service: string;
+  resourceAttributes: Record<string, string>;
+  logger?: ReturnType<LoggerProvider['getLogger']>;
+};
+
+let otlpConfig: OtlpRuntimeConfig | null = null;
 
 const LOG_LEVELS: Record<LogLevel, number> = {
   debug: 0,
@@ -56,6 +70,9 @@ function cleanStackTrace(stack: string): string {
 
 function resolveLokiConfig(config: LoggerConfig): LokiRuntimeConfig | null {
   const explicit = config.loki ?? {};
+  if (!config.loki && !process.env.LOKI_URL) {
+    return null;
+  }
   const enabled = explicit.enabled ?? true;
   if (!enabled) {
     return null;
@@ -85,6 +102,89 @@ function resolveLokiConfig(config: LoggerConfig): LokiRuntimeConfig | null {
     password: explicit.password,
     tenantId: explicit.tenantId,
   };
+}
+
+function normalizeOtlpLogsEndpoint(raw: string): string {
+  const trimmed = raw.trim().replace(/\/$/, '');
+  if (trimmed.endsWith('/v1/logs')) {
+    return trimmed;
+  }
+  return `${trimmed}/v1/logs`;
+}
+
+function parseHeaders(raw?: string): Record<string, string> {
+  if (!raw) return {};
+  return raw.split(',').reduce<Record<string, string>>((headers, item) => {
+    const index = item.indexOf('=');
+    if (index <= 0) return headers;
+    headers[item.slice(0, index).trim()] = item.slice(index + 1).trim();
+    return headers;
+  }, {});
+}
+
+function parseResourceAttributes(raw?: string): Record<string, string> {
+  if (!raw) return {};
+  return raw.split(',').reduce<Record<string, string>>((attrs, item) => {
+    const index = item.indexOf('=');
+    if (index <= 0) return attrs;
+    attrs[item.slice(0, index).trim()] = item.slice(index + 1).trim();
+    return attrs;
+  }, {});
+}
+
+function resolveOtlpConfig(config: LoggerConfig): OtlpRuntimeConfig | null {
+  const explicit = config.otlp ?? {};
+  const rawEndpoint =
+    explicit.endpoint ||
+    process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT ||
+    process.env.OTEL_EXPORTER_OTLP_ENDPOINT ||
+    '';
+  const enabled = explicit.enabled ?? rawEndpoint.trim() !== '';
+  if (!enabled || rawEndpoint.trim() === '') {
+    return null;
+  }
+
+  const service =
+    explicit.service ||
+    process.env.OTEL_SERVICE_NAME ||
+    process.env.SERVICE_NAME ||
+    process.env.COMPOSE_SERVICE ||
+    process.env.npm_package_name ||
+    path.basename(process.cwd());
+
+  const resourceAttributes = {
+    'service.name': service,
+    'service.namespace': 'gratheon',
+    'deployment.environment.name': process.env.ENV_ID || 'unknown',
+    ...parseResourceAttributes(process.env.OTEL_RESOURCE_ATTRIBUTES),
+    ...(explicit.resourceAttributes || {}),
+  };
+
+  const resolved: OtlpRuntimeConfig = {
+    enabled,
+    endpoint: normalizeOtlpLogsEndpoint(rawEndpoint),
+    headers: {
+      ...(process.env.HYPERDX_API_KEY ? { authorization: process.env.HYPERDX_API_KEY } : {}),
+      ...parseHeaders(process.env.OTEL_EXPORTER_OTLP_HEADERS),
+      ...parseHeaders(process.env.OTEL_EXPORTER_OTLP_LOGS_HEADERS),
+      ...(explicit.headers || {}),
+    },
+    service,
+    resourceAttributes,
+  };
+  const provider = new LoggerProvider({
+    resource: resourceFromAttributes(resourceAttributes),
+    processors: [
+      new SimpleLogRecordProcessor(
+        new OTLPLogExporter({
+          url: resolved.endpoint,
+          headers: resolved.headers,
+        })
+      ),
+    ],
+  });
+  resolved.logger = provider.getLogger('gratheon-log-lib', '4.0.0');
+  return resolved;
 }
 
 function log(level: string, message: string, meta?: any, fileLocation?: string) {
@@ -269,6 +369,67 @@ function safeMeta(meta: any): any {
   return meta;
 }
 
+function otlpValue(value: any): any {
+  if (value === null || value === undefined) return { stringValue: '' };
+  if (typeof value === 'string') return { stringValue: value };
+  if (typeof value === 'boolean') return { boolValue: value };
+  if (typeof value === 'number' && Number.isInteger(value)) return { intValue: String(value) };
+  if (typeof value === 'number') return { doubleValue: value };
+  return { stringValue: safeToStringMessage(value) };
+}
+
+function otlpAttributes(fields: Record<string, any>): any[] {
+  return Object.entries(fields)
+    .filter(([key]) => key !== 'trace_id' && key !== 'traceId' && key !== 'span_id' && key !== 'spanId')
+    .map(([key, value]) => ({ key, value: otlpValue(value) }));
+}
+
+function severityNumber(level: LogLevel): number {
+  switch (level) {
+    case 'debug': return 5;
+    case 'warn': return 13;
+    case 'error': return 17;
+    default: return 9;
+  }
+}
+
+function storeInOtlp(level: LogLevel, message: any, meta?: any, stacktrace?: string) {
+  if (!otlpConfig || !otlpConfig.enabled) {
+    return;
+  }
+
+  try {
+    const metaObj = safeMeta(meta);
+    const attributes = {
+      ...metaObj,
+      ...(stacktrace ? { stacktrace } : {}),
+      'log.logger': 'log-lib',
+    };
+    const record: any = {
+      timeUnixNano: `${Date.now()}000000`,
+      severityText: level.toUpperCase(),
+      severityNumber: severityNumber(level),
+      body: { stringValue: safeToStringMessage(message) },
+      attributes: otlpAttributes(attributes),
+    };
+    const traceId = metaObj.trace_id || metaObj.traceId;
+    const spanId = metaObj.span_id || metaObj.spanId;
+    if (traceId) record.traceId = String(traceId);
+    if (spanId) record.spanId = String(spanId);
+
+    otlpConfig.logger?.emit({
+      severityText: record.severityText,
+      severityNumber: record.severityNumber,
+      body: safeToStringMessage(message),
+      attributes,
+    });
+  } catch (e: any) {
+    if (process.env.ENV_ID === 'dev') {
+      console.error('[log-lib] Unexpected failure preparing OTLP log', e?.message || e);
+    }
+  }
+}
+
 function storeInLoki(level: LogLevel, message: any, meta?: any, stacktrace?: string) {
   if (!lokiConfig || !lokiConfig.enabled) {
     return;
@@ -353,6 +514,7 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
   currentLogLevel = LOG_LEVELS[configuredLevel] ?? LOG_LEVELS.info;
   
   lokiConfig = resolveLokiConfig(config);
+  otlpConfig = resolveOtlpConfig(config);
   if (config.mysql && process.env.ENV_ID === 'dev') {
     console.warn('[log-lib] `config.mysql` is deprecated and ignored. Logs are persisted to Loki.');
   }
@@ -366,6 +528,7 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
       const fileLocation = frame.file && frame.line ? `${frame.file}:${frame.line}` : undefined;
       
       log('info', safeToStringMessage(message), metaObj, fileLocation);
+      storeInOtlp('info', message, metaObj, fullTsStack);
       storeInLoki('info', message, metaObj, fullTsStack);
     },
     error: (message: string | Error | any, meta?: LogMetadata) => {
@@ -387,6 +550,7 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
         
         // For Loki: include stack and error details in metadata
         const enrichedMeta = {stack: message.stack, name: message.name, causeChain, ...metaObj};
+        storeInOtlp('error', message.message, enrichedMeta, fullTsStack);
         storeInLoki('error', message.message, enrichedMeta, fullTsStack);
         return;
       }
@@ -398,6 +562,7 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
       
       log('error', msgStr, metaObj, fileLocation);
       printStackEnhanced(message);
+      storeInOtlp('error', msgStr, metaObj, fullTsStack);
       storeInLoki('error', msgStr, metaObj, fullTsStack);
     },
     errorEnriched: (message: string, error: Error | any, meta?: LogMetadata) => {
@@ -419,6 +584,7 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
         
         // For Loki: include stack and error details in metadata
         const enrichedMeta = {stack: error.stack, name: error.name, causeChain, ...metaObj};
+        storeInOtlp('error', `${message}: ${error.message}`, enrichedMeta, fullTsStack);
         storeInLoki('error', `${message}: ${error.message}`, enrichedMeta, fullTsStack);
         return;
       }
@@ -430,6 +596,7 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
       
       log('error', `${message}: ${errStr}`, metaObj, fileLocation);
       printStackEnhanced(error);
+      storeInOtlp('error', `${message}: ${errStr}`, metaObj, fullTsStack);
       storeInLoki('error', `${message}: ${errStr}`, metaObj, fullTsStack);
     },
     warn: (message: string, meta?: LogMetadata) => {
@@ -440,6 +607,7 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
       const fileLocation = frame.file && frame.line ? `${frame.file}:${frame.line}` : undefined;
       
       log('warn', safeToStringMessage(message), metaObj, fileLocation);
+      storeInOtlp('warn', message, metaObj, fullTsStack);
       storeInLoki('warn', message, metaObj, fullTsStack);
     },
 
@@ -462,6 +630,7 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
       const fileLocation = frame.file && frame.line ? `${frame.file}:${frame.line}` : undefined;
       
       log("info", messageString, undefined, fileLocation);
+      storeInOtlp("info", messageString);
       storeInLoki("info", messageString);
     },
     error: (msg: any, ...args: any[]) => {
@@ -473,6 +642,7 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
       const fileLocation = frame.file && frame.line ? `${frame.file}:${frame.line}` : undefined;
       
       log("error", errorMessage, meta, fileLocation);
+      storeInOtlp("error", typeof msg === 'object' ? jsonStringify(msg) : errorMessage, meta, fullTsStack);
       storeInLoki("error", typeof msg === 'object' ? jsonStringify(msg) : errorMessage, meta, fullTsStack);
     },
     warn: (msg: any, ...args: any[]) => {
@@ -483,6 +653,7 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
       const fileLocation = frame.file && frame.line ? `${frame.file}:${frame.line}` : undefined;
       
       log("warn", messageString, undefined, fileLocation);
+      storeInOtlp("warn", messageString, undefined, fullTsStack);
       storeInLoki("warn", messageString, undefined, fullTsStack);
     },
 
@@ -503,6 +674,7 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
       const fileLocation = frame.file && frame.line ? `${frame.file}:${frame.line}` : undefined;
       
       log("error", messageString, undefined, fileLocation);
+      storeInOtlp("error", messageString, undefined, fullTsStack);
       storeInLoki("error", messageString, undefined, fullTsStack);
       // Exit after a brief delay to allow logs to flush
       setTimeout(() => process.exit(1), 100);

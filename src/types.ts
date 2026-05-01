@@ -10,7 +10,16 @@ export interface LokiConfig {
   enabled?: boolean; // defaults to true
 }
 
+export interface OtlpConfig {
+  endpoint?: string; // defaults to OTEL_EXPORTER_OTLP_LOGS_ENDPOINT or OTEL_EXPORTER_OTLP_ENDPOINT
+  headers?: Record<string, string>;
+  service?: string; // defaults to OTEL_SERVICE_NAME, SERVICE_NAME, or current folder name
+  resourceAttributes?: Record<string, string>;
+  enabled?: boolean; // defaults to true when an OTLP endpoint is configured
+}
+
 export interface LoggerConfig {
+  otlp?: OtlpConfig;
   loki?: LokiConfig;
   /**
    * @deprecated MySQL persistence has been replaced by Loki.
