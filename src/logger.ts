@@ -1,6 +1,4 @@
 import 'source-map-support/register';
-import * as http from 'http';
-import * as https from 'https';
 import jsonStringify from "fast-safe-stringify";
 import * as fs from 'fs';
 import * as path from 'path';
@@ -8,18 +6,6 @@ import { LoggerProvider, SimpleLogRecordProcessor } from '@opentelemetry/sdk-log
 import { OTLPLogExporter } from '@opentelemetry/exporter-logs-otlp-proto';
 import { resourceFromAttributes } from '@opentelemetry/resources';
 import { LoggerConfig, Logger, FastifyLogger, LogMetadata, LogLevel } from "./types";
-
-type LokiRuntimeConfig = {
-  enabled: boolean;
-  url: string;
-  service: string;
-  labels: Record<string, string>;
-  username?: string;
-  password?: string;
-  tenantId?: string;
-};
-
-let lokiConfig: LokiRuntimeConfig | null = null;
 
 type OtlpRuntimeConfig = {
   enabled: boolean;
@@ -66,42 +52,6 @@ function cleanStackTrace(stack: string): string {
       return `at ${cleaned}`;
     });
   }).join('\n');
-}
-
-function resolveLokiConfig(config: LoggerConfig): LokiRuntimeConfig | null {
-  const explicit = config.loki ?? {};
-  if (!config.loki && !process.env.LOKI_URL) {
-    return null;
-  }
-  const enabled = explicit.enabled ?? true;
-  if (!enabled) {
-    return null;
-  }
-
-  const url = explicit.url || process.env.LOKI_URL || 'http://loki:3100/loki/api/v1/push';
-  const service =
-    explicit.service ||
-    process.env.SERVICE_NAME ||
-    process.env.COMPOSE_SERVICE ||
-    process.env.npm_package_name ||
-    path.basename(process.cwd());
-
-  const labels: Record<string, string> = {
-    service,
-    env: process.env.ENV_ID || 'unknown',
-    logger: 'log-lib',
-    ...(explicit.labels || {}),
-  };
-
-  return {
-    enabled,
-    url,
-    service,
-    labels,
-    username: explicit.username,
-    password: explicit.password,
-    tenantId: explicit.tenantId,
-  };
 }
 
 function normalizeOtlpLogsEndpoint(raw: string): string {
@@ -430,80 +380,6 @@ function storeInOtlp(level: LogLevel, message: any, meta?: any, stacktrace?: str
   }
 }
 
-function storeInLoki(level: LogLevel, message: any, meta?: any, stacktrace?: string) {
-  if (!lokiConfig || !lokiConfig.enabled) {
-    return;
-  }
-
-  try {
-    const nowNs = `${Date.now()}000000`;
-    const payloadObject = {
-      timestamp: new Date().toISOString(),
-      level,
-      service: lokiConfig.service,
-      message: safeToStringMessage(message),
-      meta: safeMeta(meta),
-      stacktrace: stacktrace || '',
-    };
-
-    const line = jsonStringify(payloadObject).slice(0, 120_000);
-    const body = jsonStringify({
-      streams: [
-        {
-          stream: lokiConfig.labels,
-          values: [[nowNs, line]],
-        },
-      ],
-    });
-
-    const target = new URL(lokiConfig.url);
-    const isHttps = target.protocol === 'https:';
-    const client = isHttps ? https : http;
-    const headers: Record<string, string> = {
-      'content-type': 'application/json',
-      'content-length': Buffer.byteLength(body).toString(),
-    };
-
-    if (lokiConfig.tenantId) {
-      headers['X-Scope-OrgID'] = lokiConfig.tenantId;
-    }
-    if (lokiConfig.username && lokiConfig.password) {
-      const basic = Buffer.from(`${lokiConfig.username}:${lokiConfig.password}`).toString('base64');
-      headers['authorization'] = `Basic ${basic}`;
-    }
-
-    const req = client.request(
-      {
-        protocol: target.protocol,
-        hostname: target.hostname,
-        port: target.port || (isHttps ? 443 : 80),
-        path: `${target.pathname}${target.search}`,
-        method: 'POST',
-        headers,
-      },
-      (res) => {
-        if (res.statusCode && res.statusCode >= 400 && process.env.ENV_ID === 'dev') {
-          console.error(`[log-lib] Failed to persist log to Loki: HTTP ${res.statusCode}`);
-        }
-        res.resume();
-      }
-    );
-
-    req.on('error', (e: any) => {
-      if (process.env.ENV_ID === 'dev') {
-        console.error('[log-lib] Failed to persist log to Loki', e?.message || e);
-      }
-    });
-
-    req.write(body);
-    req.end();
-  } catch (e: any) {
-    if (process.env.ENV_ID === 'dev') {
-      console.error('[log-lib] Unexpected failure preparing log for Loki', e?.message || e);
-    }
-  }
-}
-
 export function createLogger(config: LoggerConfig = {}): { logger: Logger; fastifyLogger: FastifyLogger } {
   // Set up log level filtering
   // Priority: 1) config.logLevel, 2) process.env.LOG_LEVEL, 3) default based on ENV_ID
@@ -513,10 +389,9 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
   
   currentLogLevel = LOG_LEVELS[configuredLevel] ?? LOG_LEVELS.info;
   
-  lokiConfig = resolveLokiConfig(config);
   otlpConfig = resolveOtlpConfig(config);
   if (config.mysql && process.env.ENV_ID === 'dev') {
-    console.warn('[log-lib] `config.mysql` is deprecated and ignored. Logs are persisted to Loki.');
+    console.warn('[log-lib] `config.mysql` is deprecated and ignored. Logs are exported with OTLP.');
   }
 
   const logger: Logger = {
@@ -529,7 +404,6 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
       
       log('info', safeToStringMessage(message), metaObj, fileLocation);
       storeInOtlp('info', message, metaObj, fullTsStack);
-      storeInLoki('info', message, metaObj, fullTsStack);
     },
     error: (message: string | Error | any, meta?: LogMetadata) => {
       const metaObj = safeMeta(meta);
@@ -548,10 +422,8 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
           console.log('\x1b[35mCause chain:\x1b[0m ' + causeChain.join(' -> '));
         }
         
-        // For Loki: include stack and error details in metadata
         const enrichedMeta = {stack: message.stack, name: message.name, causeChain, ...metaObj};
         storeInOtlp('error', message.message, enrichedMeta, fullTsStack);
-        storeInLoki('error', message.message, enrichedMeta, fullTsStack);
         return;
       }
       const msgStr = safeToStringMessage(message);
@@ -563,7 +435,6 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
       log('error', msgStr, metaObj, fileLocation);
       printStackEnhanced(message);
       storeInOtlp('error', msgStr, metaObj, fullTsStack);
-      storeInLoki('error', msgStr, metaObj, fullTsStack);
     },
     errorEnriched: (message: string, error: Error | any, meta?: LogMetadata) => {
       const metaObj = safeMeta(meta);
@@ -582,10 +453,8 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
           console.log('\x1b[35mCause chain:\x1b[0m ' + causeChain.join(' -> '));
         }
         
-        // For Loki: include stack and error details in metadata
         const enrichedMeta = {stack: error.stack, name: error.name, causeChain, ...metaObj};
         storeInOtlp('error', `${message}: ${error.message}`, enrichedMeta, fullTsStack);
-        storeInLoki('error', `${message}: ${error.message}`, enrichedMeta, fullTsStack);
         return;
       }
       const errStr = safeToStringMessage(error);
@@ -597,7 +466,6 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
       log('error', `${message}: ${errStr}`, metaObj, fileLocation);
       printStackEnhanced(error);
       storeInOtlp('error', `${message}: ${errStr}`, metaObj, fullTsStack);
-      storeInLoki('error', `${message}: ${errStr}`, metaObj, fullTsStack);
     },
     warn: (message: string, meta?: LogMetadata) => {
       const metaObj = safeMeta(meta);
@@ -608,7 +476,6 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
       
       log('warn', safeToStringMessage(message), metaObj, fileLocation);
       storeInOtlp('warn', message, metaObj, fullTsStack);
-      storeInLoki('warn', message, metaObj, fullTsStack);
     },
 
     // do not store debug logs in DB
@@ -631,7 +498,6 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
       
       log("info", messageString, undefined, fileLocation);
       storeInOtlp("info", messageString);
-      storeInLoki("info", messageString);
     },
     error: (msg: any, ...args: any[]) => {
       const errorMessage = (msg && msg.message) ? msg.message : String(msg);
@@ -643,7 +509,6 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
       
       log("error", errorMessage, meta, fileLocation);
       storeInOtlp("error", typeof msg === 'object' ? jsonStringify(msg) : errorMessage, meta, fullTsStack);
-      storeInLoki("error", typeof msg === 'object' ? jsonStringify(msg) : errorMessage, meta, fullTsStack);
     },
     warn: (msg: any, ...args: any[]) => {
       const messageString = typeof msg === 'object' ? jsonStringify(msg) : String(msg);
@@ -654,7 +519,6 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
       
       log("warn", messageString, undefined, fileLocation);
       storeInOtlp("warn", messageString, undefined, fullTsStack);
-      storeInLoki("warn", messageString, undefined, fullTsStack);
     },
 
     // do not store debug logs in DB
@@ -675,7 +539,6 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
       
       log("error", messageString, undefined, fileLocation);
       storeInOtlp("error", messageString, undefined, fullTsStack);
-      storeInLoki("error", messageString, undefined, fullTsStack);
       // Exit after a brief delay to allow logs to flush
       setTimeout(() => process.exit(1), 100);
     },

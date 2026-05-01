@@ -6,13 +6,12 @@ TypeScript logging library for Gratheon services with colored console output and
 
 `4.0.0` is the ClickStack/OTLP major release.
 
-Breaking behavior change: Loki is no longer enabled implicitly. Configure `OTEL_EXPORTER_OTLP_ENDPOINT` for ClickStack logs, or set `LOKI_URL`/`config.loki` if a service still needs Loki during migration.
+Breaking behavior change: Loki support has been removed. Configure `OTEL_EXPORTER_OTLP_ENDPOINT` for ClickStack logs.
 
 ## Features
 
 - Colored console logger for `info`, `warn`, `error`, and `debug`
 - Optional OTLP HTTP JSON export for logs
-- Optional Loki compatibility transport
 - File/line capture for TypeScript callsites
 - Enriched error logging with stack traces, cause chains, and dev-mode code frames
 - Fastify logger adapter
@@ -57,18 +56,5 @@ logger.errorEnriched('job failed', new Error('boom'), { job: 'sync' });
 ```
 
 Trace correlation is supported when metadata includes `trace_id`/`traceId` and `span_id`/`spanId`.
-
-## Compatibility
-
-Loki remains available explicitly:
-
-```typescript
-createLogger({
-  loki: {
-    url: 'http://loki:3100/loki/api/v1/push',
-    service: 'legacy-service',
-  },
-});
-```
 
 `mysql` config is ignored and kept only so older services continue compiling while they migrate.

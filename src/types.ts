@@ -1,15 +1,5 @@
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
-export interface LokiConfig {
-  url?: string; // defaults to process.env.LOKI_URL or http://loki:3100/loki/api/v1/push
-  username?: string;
-  password?: string;
-  tenantId?: string;
-  service?: string; // defaults to process.env.SERVICE_NAME or current folder name
-  labels?: Record<string, string>;
-  enabled?: boolean; // defaults to true
-}
-
 export interface OtlpConfig {
   endpoint?: string; // defaults to OTEL_EXPORTER_OTLP_LOGS_ENDPOINT or OTEL_EXPORTER_OTLP_ENDPOINT
   headers?: Record<string, string>;
@@ -20,9 +10,8 @@ export interface OtlpConfig {
 
 export interface LoggerConfig {
   otlp?: OtlpConfig;
-  loki?: LokiConfig;
   /**
-   * @deprecated MySQL persistence has been replaced by Loki.
+   * @deprecated MySQL persistence has been replaced by OTLP.
    * Kept only for backward compatibility and ignored.
    */
   mysql?: {
