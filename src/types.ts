@@ -10,6 +10,7 @@ export interface OtlpConfig {
 
 export interface LoggerConfig {
   otlp?: OtlpConfig;
+  traces?: OtlpConfig;
   /**
    * @deprecated MySQL persistence has been replaced by OTLP.
    * Kept only for backward compatibility and ignored.

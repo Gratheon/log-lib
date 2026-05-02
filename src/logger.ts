@@ -5,7 +5,9 @@ import * as path from 'path';
 import { LoggerProvider, SimpleLogRecordProcessor } from '@opentelemetry/sdk-logs';
 import { OTLPLogExporter } from '@opentelemetry/exporter-logs-otlp-proto';
 import { resourceFromAttributes } from '@opentelemetry/resources';
+import { context } from '@opentelemetry/api';
 import { LoggerConfig, Logger, FastifyLogger, LogMetadata, LogLevel } from "./types";
+import { configureTracing } from './tracing';
 
 type OtlpRuntimeConfig = {
   enabled: boolean;
@@ -368,6 +370,7 @@ function storeInOtlp(level: LogLevel, message: any, meta?: any, stacktrace?: str
     if (spanId) record.spanId = String(spanId);
 
     otlpConfig.logger?.emit({
+      context: context.active(),
       severityText: record.severityText,
       severityNumber: record.severityNumber,
       body: safeToStringMessage(message),
@@ -389,6 +392,7 @@ export function createLogger(config: LoggerConfig = {}): { logger: Logger; fasti
   
   currentLogLevel = LOG_LEVELS[configuredLevel] ?? LOG_LEVELS.info;
   
+  configureTracing(config);
   otlpConfig = resolveOtlpConfig(config);
   if (config.mysql && process.env.ENV_ID === 'dev') {
     console.warn('[log-lib] `config.mysql` is deprecated and ignored. Logs are exported with OTLP.');
