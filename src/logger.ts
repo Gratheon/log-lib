@@ -318,6 +318,8 @@ function safeToStringMessage(message: any): string {
 
 function safeMeta(meta: any): any {
   if (!meta) return {};
+  if (Array.isArray(meta)) return { meta };
+  if (typeof meta !== 'object') return { meta };
   return meta;
 }
 
