@@ -10,6 +10,7 @@ import { LoggerConfig } from './types';
 type HeaderCarrier = Record<string, string | string[] | undefined>;
 
 let tracingConfigured = false;
+const tracer = trace.getTracer('gratheon-log-lib', '4.1.2');
 
 function normalizeOtlpTracesEndpoint(raw: string): string {
   const trimmed = raw.trim().replace(/\/$/, '');
@@ -122,6 +123,79 @@ export function traceHeaders(headers: Record<string, string> = {}): Record<strin
   return injectTraceHeaders(headers);
 }
 
+export interface TraceHttpClientOptions<THeaders extends { set?: (key: string, value: string) => void } | Record<string, any>> {
+  method?: string;
+  url: string;
+  name?: string;
+  headers?: THeaders;
+}
+
+function httpClientAttributes(method: string, rawUrl: string): Record<string, string | number> {
+  const attributes: Record<string, string | number> = {
+    'http.method': method,
+    'http.request.method': method,
+    'url.full': rawUrl,
+  };
+
+  try {
+    const parsed = new URL(rawUrl);
+    attributes['server.address'] = parsed.hostname;
+    if (parsed.port) {
+      attributes['server.port'] = Number(parsed.port);
+    }
+    attributes['url.scheme'] = parsed.protocol.replace(':', '');
+  } catch {
+    // Keep tracing useful even for non-standard internal URLs.
+  }
+
+  return attributes;
+}
+
+export async function traceHttpClient<T, THeaders extends { set?: (key: string, value: string) => void } | Record<string, any>>(
+  options: TraceHttpClientOptions<THeaders>,
+  fn: () => Promise<T>
+): Promise<T> {
+  configureTracing();
+
+  const method = (options.method || 'GET').toUpperCase();
+  const span = tracer.startSpan(options.name || `${method} ${options.url}`, {
+    kind: SpanKind.CLIENT,
+    attributes: httpClientAttributes(method, options.url),
+  });
+  const activeContext = trace.setSpan(context.active(), span);
+
+  if (options.headers) {
+    propagation.inject(activeContext, options.headers, {
+      set(carrier: any, key: string, value: string) {
+        if (carrier && typeof carrier.set === 'function') {
+          carrier.set(key, value);
+          return;
+        }
+        carrier[key] = value;
+      },
+    });
+  }
+
+  try {
+    const result = await context.with(activeContext, fn);
+    const statusCode = (result as any)?.status ?? (result as any)?.statusCode;
+    if (typeof statusCode === 'number') {
+      span.setAttribute('http.status_code', statusCode);
+      span.setAttribute('http.response.status_code', statusCode);
+      if (statusCode >= 500) {
+        span.setStatus({ code: SpanStatusCode.ERROR });
+      }
+    }
+    return result;
+  } catch (error: any) {
+    span.recordException(error);
+    span.setStatus({ code: SpanStatusCode.ERROR, message: error?.message || String(error) });
+    throw error;
+  } finally {
+    span.end();
+  }
+}
+
 const headerGetter = {
   keys(carrier: HeaderCarrier): string[] {
     return Object.keys(carrier || {});
@@ -150,7 +224,7 @@ export function traceExpressMiddleware(config: LoggerConfig = {}) {
   return (req: any, res: any, next: any) => {
     const parentContext = propagation.extract(context.active(), req.headers || {}, headerGetter);
     const route = req.route?.path || req.path || req.url || 'unknown';
-    const span = trace.getTracer('gratheon-log-lib', '4.0.0').startSpan(`${req.method} ${route}`, {
+    const span = tracer.startSpan(`${req.method} ${route}`, {
       kind: SpanKind.SERVER,
       attributes: {
         'http.method': req.method,
@@ -174,7 +248,7 @@ export function registerFastifyTracing(app: any, config: LoggerConfig = {}) {
   app.addHook('onRequest', (request: any, _reply: any, done: any) => {
     const parentContext = propagation.extract(context.active(), request.headers || {}, headerGetter);
     const route = request.routerPath || request.routeOptions?.url || request.raw?.url || request.url || 'unknown';
-    const span = trace.getTracer('gratheon-log-lib', '4.0.0').startSpan(`${request.method} ${route}`, {
+    const span = tracer.startSpan(`${request.method} ${route}`, {
       kind: SpanKind.SERVER,
       attributes: {
         'http.method': request.method,
