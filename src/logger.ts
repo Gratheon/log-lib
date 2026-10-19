@@ -127,12 +127,12 @@ function resolveOtlpConfig(config: LoggerConfig): OtlpRuntimeConfig | null {
   const provider = new LoggerProvider({
     resource: resourceFromAttributes(resourceAttributes),
     processors: [
-      new SimpleLogRecordProcessor(
-        new OTLPLogExporter({
+      new SimpleLogRecordProcessor({
+        exporter: new OTLPLogExporter({
           url: resolved.endpoint,
           headers: resolved.headers,
-        })
-      ),
+        }),
+      }),
     ],
   });
   resolved.logger = provider.getLogger('gratheon-log-lib', '4.0.0');
