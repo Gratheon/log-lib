@@ -109,7 +109,7 @@ function resolveOtlpConfig(config: LoggerConfig): OtlpRuntimeConfig | null {
     'service.namespace': 'gratheon',
     'deployment.environment.name': process.env.ENV_ID || 'unknown',
     ...parseResourceAttributes(process.env.OTEL_RESOURCE_ATTRIBUTES),
-    ...(explicit.resourceAttributes || {}),
+    ...explicit.resourceAttributes,
   };
 
   const resolved: OtlpRuntimeConfig = {
@@ -119,7 +119,7 @@ function resolveOtlpConfig(config: LoggerConfig): OtlpRuntimeConfig | null {
       ...(process.env.HYPERDX_API_KEY ? { authorization: process.env.HYPERDX_API_KEY } : {}),
       ...parseHeaders(process.env.OTEL_EXPORTER_OTLP_HEADERS),
       ...parseHeaders(process.env.OTEL_EXPORTER_OTLP_LOGS_HEADERS),
-      ...(explicit.headers || {}),
+      ...explicit.headers,
     },
     service,
     resourceAttributes,
@@ -141,6 +141,7 @@ function resolveOtlpConfig(config: LoggerConfig): OtlpRuntimeConfig | null {
 
 function log(level: string, message: string, meta?: any, fileLocation?: string) {
   // Check if this log level should be filtered
+  // oxlint-disable-next-line no-control-regex -- matches ANSI escape codes
   const levelKey = level.replace(/\x1b\[\d+m/g, '') as LogLevel; // Remove ANSI codes for comparison
   const messageLevel = LOG_LEVELS[levelKey];
   if (messageLevel !== undefined && messageLevel < currentLogLevel) {

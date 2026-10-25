@@ -68,7 +68,7 @@ function resolveTraceConfig(config: LoggerConfig) {
     'service.namespace': 'gratheon',
     'deployment.environment.name': process.env.ENV_ID || 'unknown',
     ...parseResourceAttributes(process.env.OTEL_RESOURCE_ATTRIBUTES),
-    ...(explicit.resourceAttributes || {}),
+    ...explicit.resourceAttributes,
   };
 
   return {
@@ -77,7 +77,7 @@ function resolveTraceConfig(config: LoggerConfig) {
       ...(process.env.HYPERDX_API_KEY ? { authorization: process.env.HYPERDX_API_KEY } : {}),
       ...parseHeaders(process.env.OTEL_EXPORTER_OTLP_HEADERS),
       ...parseHeaders(process.env.OTEL_EXPORTER_OTLP_TRACES_HEADERS),
-      ...(explicit.headers || {}),
+      ...explicit.headers,
     },
     service,
     resourceAttributes,
