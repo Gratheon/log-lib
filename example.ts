@@ -10,7 +10,7 @@ const config: LoggerConfig = {
 };
 
 // Create logger instances
-const { logger, fastifyLogger } = createLogger(config);
+const { logger } = createLogger(config);
 
 // Example usage
 logger.info('Application started successfully');
